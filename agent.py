@@ -1,8 +1,11 @@
+import asyncio
 import logging
 import os
 
 from dotenv import load_dotenv
-from livekit import agents
+
+# from livekit import agents
+from livekit import api
 from livekit.agents import (
     Agent,
     AgentSession,
@@ -10,24 +13,34 @@ from livekit.agents import (
     JobProcess,
     RoomInputOptions,
     WorkerOptions,
+    cli,
 )
-from livekit.plugins import deepgram, noise_cancellation, openai, silero, turn_detector
+from livekit.agents.events import RunContext
+from livekit.agents.llm import function_tool
+from livekit.agents.voice import Agent
+from livekit.plugins import deepgram, openai, silero
 from livekit.plugins.elevenlabs import tts
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
+from livekit.protocol import sip as proto_sip
+
+# from livekit.protocol.sip import TransferSIPParticipantRequest
 
 # Configuración básica
 load_dotenv(dotenv_path=".env")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("voice-agent")
 
+
 class Assistant(Agent):
     """Asistente de voz personalizado."""
 
     def __init__(self) -> None:
-        super().__init__(instructions="""
+        super().__init__(
+            instructions="""
             Eres un asistente amable y respondes preguntas en español de forma clara y concisa.
             Proporcionas información útil y mantienes un tono cordial en todo momento.
-        """)
+        """
+        )
         # Datos específicos de la sesión
         self.room_name = None
         self.participant_identity = None
@@ -40,6 +53,75 @@ class Assistant(Agent):
     def get_data(self, key, default=None):
         """Recupera datos del contexto."""
         return self.session_data.get(key, default)
+
+    @function_tool()
+    async def transfer_call(self, ctx: RunContext):
+        """Transfiere la llamada de una manera despectiva, donde indiques tu molestia al no querer ser atendido."""
+
+        room = ctx.userdata.ctx.room
+        identity = room.local_participant.identity
+        transfer_number = f"sip:5652917934@127.0.0.1:49999"
+        dept_name = "Agente"
+        ctx.userdata.selected_department = dept_name
+
+        await self._handle_transfer(identity, transfer_number, dept_name)
+        return f"Transferring to {dept_name} department."
+
+
+    async def _handle_transfer(
+        self, identity: str, transfer_number: str, department: str
+    ) -> None:
+        """
+        Handle the transfer process with department-specific messaging.
+
+        Args:
+            identity (str): The participant's identity
+            transfer_number (str): The number to transfer to
+            department (str): The name of the department
+        """
+        await self.session.generate_reply(
+            user_input=f"En un momento sera transferido al deparamento de {department}. Por favor, no cuelgue la llamada."
+        )
+        await asyncio.sleep(6)
+        await self.transfer_call(identity, transfer_number)
+
+    async def transfer_call(self, participant_identity: str, transfer_to: str) -> None:
+        """
+        Transfer the SIP call to another number.
+
+        Args:
+            participant_identity (str): The identity of the participant.
+            transfer_to (str): The phone number to transfer the call to.
+        """
+        logger.info(f"Transferring call for participant {participant_identity} to {transfer_to}")
+
+        try:
+            userdata = self.session.userdata
+            if not userdata.livekit_api:
+                livekit_url = os.getenv('LIVEKIT_URL')
+                api_key = os.getenv('LIVEKIT_API_KEY')
+                api_secret = os.getenv('LIVEKIT_API_SECRET')
+                logger.debug(f"Initializing LiveKit API client with URL: {livekit_url}")
+                userdata.livekit_api = api.LiveKitAPI(
+                    url=livekit_url,
+                    api_key=api_key,
+                    api_secret=api_secret
+                )
+
+            transfer_request = proto_sip.TransferSIPParticipantRequest(
+                participant_identity=participant_identity,
+                room_name=userdata.ctx.room.name,
+                transfer_to=transfer_to,
+                play_dialtone=True
+            )
+            logger.debug(f"Transfer request: {transfer_request}")
+
+            await userdata.livekit_api.sip.transfer_sip_participant(transfer_request)
+            logger.info(f"Successfully transferred participant {participant_identity} to {transfer_to}")
+
+        except Exception as e:
+            logger.error(f"Failed to transfer call: {e}", exc_info=True)
+            await self.session.generate_reply(user_input="Lo sentimos, no fue posible llevar a cabo la transferencia en estos momentos. Hay algo mas en lo que te pueda apoyar?")
 
 
 def prewarm(proc: JobProcess):
@@ -111,7 +193,10 @@ async def entrypoint(ctx: JobContext):
 
 
 if __name__ == "__main__":
-    agents.cli.run_app(WorkerOptions(
-        entrypoint_fnc=entrypoint,
-        prewarm_fnc=prewarm,
-    ))
+    cli.run_app(
+        WorkerOptions(
+            # agents.cli.run_app(WorkerOptions(
+            entrypoint_fnc=entrypoint,
+            prewarm_fnc=prewarm,
+        )
+    )
